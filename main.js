@@ -1,7 +1,6 @@
 const { Plugin, FileView, Notice, TFile } = require("obsidian");
 const { shell } = require("electron");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { execFile } = require("child_process");
 
@@ -89,6 +88,7 @@ class ArchiveView extends FileView {
     this.filtered = [];
     this.query = "";
     this.objectUrls = [];
+    this.leftPaneWidth = 36;
   }
 
   getViewType() { return VIEW_TYPE; }
@@ -96,11 +96,12 @@ class ArchiveView extends FileView {
   getIcon() { return "archive"; }
   canAcceptExtension(extension) { return ARCHIVE_EXTENSIONS.includes(String(extension || "").toLowerCase()); }
   async onLoadFile(file) { await this.setArchiveFile(file); }
-  getState() { return { file: this.file ? this.file.path : "" }; }
+  getState() { return { file: this.file ? this.file.path : "", leftPaneWidth: this.leftPaneWidth }; }
   async onClose() { this.revokeUrls(); }
 
   async setState(state, result) {
     await super.setState(state, result);
+    if (state && typeof state.leftPaneWidth === "number") this.leftPaneWidth = clamp(state.leftPaneWidth, 20, 75);
     if (state && state.file) {
       const f = this.app.vault.getAbstractFileByPath(state.file);
       if (f instanceof TFile) await this.setArchiveFile(f);
@@ -134,9 +135,48 @@ class ArchiveView extends FileView {
     input.oninput = () => { this.query = input.value || ""; this.applyFilter(); };
 
     const body = root.createDiv({ cls: "zip-viewer-body" });
+    this.bodyEl = body;
     this.listEl = body.createDiv({ cls: "zip-viewer-list" });
+    this.splitterEl = body.createDiv({ cls: "zip-viewer-splitter", attr: { title: "Drag to resize" } });
     this.previewEl = body.createDiv({ cls: "zip-viewer-preview" });
     this.previewEl.createDiv({ cls: "zip-viewer-empty", text: "Select a file inside the archive." });
+    this.applyPaneWidth();
+    this.setupSplitter();
+  }
+
+  applyPaneWidth() {
+    if (!this.bodyEl || !this.listEl || !this.previewEl) return;
+    const left = clamp(this.leftPaneWidth, 20, 75);
+    this.listEl.style.flexBasis = left + "%";
+    this.previewEl.style.flexBasis = "calc(" + (100 - left) + "% - 6px)";
+  }
+
+  setupSplitter() {
+    if (!this.splitterEl || !this.bodyEl) return;
+    let dragging = false;
+    const onMove = event => {
+      if (!dragging) return;
+      const rect = this.bodyEl.getBoundingClientRect();
+      if (!rect.width) return;
+      const x = event.clientX - rect.left;
+      this.leftPaneWidth = clamp((x / rect.width) * 100, 20, 75);
+      this.applyPaneWidth();
+      event.preventDefault();
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.removeClass("zip-viewer-resizing");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    this.splitterEl.onmousedown = event => {
+      dragging = true;
+      document.body.addClass("zip-viewer-resizing");
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      event.preventDefault();
+    };
   }
 
   async loadEntries() {
@@ -144,7 +184,7 @@ class ArchiveView extends FileView {
       this.setStatus("Reading archive through 7-Zip...");
       const archivePath = this.plugin.fullPath(this.file);
       if (!archivePath) throw new Error("Cannot resolve archive path");
-      const stdout = await exec7z(this.plugin.sevenZip, ["l", "-slt", "-ba", archivePath], { maxBuffer: 128 * 1024 * 1024 });
+      const stdout = await exec7z(this.plugin.sevenZip, ["l", "-slt", "-ba", "-sccUTF-8", archivePath], { maxBuffer: 128 * 1024 * 1024 });
       this.entries = parse7zListing(stdout.toString("utf8"));
       this.filtered = this.entries.slice();
       this.renderList();
@@ -208,7 +248,7 @@ class ArchiveView extends FileView {
     try {
       this.setStatus("Extracting preview...");
       const archivePath = this.plugin.fullPath(this.file);
-      const data = await exec7z(this.plugin.sevenZip, ["x", "-so", archivePath, entry.path], { maxBuffer: 128 * 1024 * 1024 });
+      const data = await exec7z(this.plugin.sevenZip, ["x", "-so", "-sccUTF-8", archivePath, entry.path], { maxBuffer: 128 * 1024 * 1024 });
       if (IMAGE_EXTENSIONS.has(ext)) return this.previewImage(data, ext);
       return this.previewText(data, ext);
     } catch (e) {
@@ -219,7 +259,7 @@ class ArchiveView extends FileView {
   }
 
   previewText(buffer, ext) {
-    let text = buffer.toString("utf8");
+    let text = decodeText(buffer);
     if (ext === "json") {
       try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (e) {}
     }
@@ -251,6 +291,18 @@ function isArchive(file) { return ARCHIVE_EXTENSIONS.includes(String(file.extens
 function extOf(name) { const i = String(name).lastIndexOf("."); return i >= 0 ? String(name).slice(i + 1).toLowerCase() : ""; }
 function iconFor(name) { const ext = extOf(name); if (IMAGE_EXTENSIONS.has(ext)) return "🖼"; if (TEXT_EXTENSIONS.has(ext)) return "📄"; return "📦"; }
 function formatBytes(n) { n = Number(n || 0); if (n < 1024) return n + " B"; if (n < 1048576) return (n / 1024).toFixed(1) + " KB"; if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB"; return (n / 1073741824).toFixed(1) + " GB"; }
+function clamp(value, min, max) { return Math.max(min, Math.min(max, Number(value) || min)); }
+
+function decodeText(buffer) {
+  const encodings = ["utf-8", "windows-1251", "ibm866"];
+  for (const encoding of encodings) {
+    try {
+      const text = new TextDecoder(encoding).decode(buffer);
+      if (!text.includes("�")) return text;
+    } catch (e) {}
+  }
+  return buffer.toString("utf8");
+}
 
 function parse7zListing(text) {
   const entries = [];
